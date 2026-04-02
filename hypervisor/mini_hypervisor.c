@@ -8,11 +8,18 @@
 #include <string.h>
 #include <stdint.h>
 #include <linux/kvm.h>
+#include <pthread.h>
+
 
 //#define MEM_SIZE (2u * 1024u * 1024u) // Memory size will be 2MB
 
 uint32_t MEM_SIZE; // Keeping the same name as the original macro
 uint32_t PAGE_SIZE; // Same naming for consistency
+
+#define MAX_GUESTS 16
+
+pthread_mutex_t io_lock;
+pthread_mutex_t output_mutex;
 
 
 //#define GUEST_START_ADDR 0x8000 // Start address for loading the guest
@@ -264,18 +271,18 @@ static int32_t args_error(const char* error)
         "Usage:\n"
         "<program_name> [options]\n\n"
         "Options:\n"
-        " -m, --memory <2|4|8>          Specify between 2, 4 or 8MB memory size.\n"
-        " -p, --page <2|4>              Specify between 2MB and 4KB page size.\n"
-        " -g, --guest <image_name>.img  Specify image file.\n"
+        " -m, --memory <2|4|8>              Specify between 2, 4 or 8MB memory size.\n"
+        " -p, --page <2|4>                  Specify between 2MB and 4KB page size.\n"
+        " -g, --guest <img1> [img2] ...     Specify one or more guest image files.\n"
         );
     return -1;
 }
 
-static int32_t check_args(int argc, char *argv[], uint32_t* memory_size, uint32_t* page_size, char** guest_img) {
-    // Check if command line arguments are valid
-
+static int32_t check_args(int argc, char *argv[], uint32_t* memory_size, uint32_t* page_size, char** guest_imgs, int* guest_count) {
+	// Check if command line arguments are valid
     int16_t memf_cnt, pgf_cnt, gstf_cnt;
     memf_cnt = pgf_cnt = gstf_cnt = 0;
+    *guest_count = 0;
 
     for (size_t i = 1; i < argc; i++)
     {
@@ -285,14 +292,13 @@ static int32_t check_args(int argc, char *argv[], uint32_t* memory_size, uint32_
             if (++i < argc)
                 *memory_size = atoi(argv[i]);
             else 
-                return args_error("Error: Invalid memroy size argument.\n");
+                return args_error("Error: Invalid memory size argument.\n");
             
             if (++memf_cnt > 1)
                 return args_error("Error: Multiple memory options specified.\n");
             
             if (*memory_size != 2 && *memory_size != 4 && *memory_size != 8)
-                return args_error("Error: Invalid memroy size argument.\n");
-
+                return args_error("Error: Invalid memory size argument.\n");
         }
         else if (!strcmp(argv[i], "--page") || !strcmp(argv[i], "-p"))
         {
@@ -309,29 +315,44 @@ static int32_t check_args(int argc, char *argv[], uint32_t* memory_size, uint32_
         }
         else if (!strcmp(argv[i], "--guest") || !strcmp(argv[i], "-g"))
         {
-            if (++i < argc) // Nothing for now
-                *guest_img = argv[i];
-            else 
-                return args_error("Error: Invalid guest image path.\n");
-
             if (++gstf_cnt > 1)
                 return args_error("Error: Multiple guest options specified.\n");
+
+            while (i + 1 < argc && argv[i+1][0] != '-') {
+                if (*guest_count >= MAX_GUESTS)
+                    return args_error("Error: Too many guest images.\n");
+
+                guest_imgs[(*guest_count)++] = argv[++i];
+            }
+
+            if (*guest_count == 0)
+                return args_error("Error: No guest image specified after --guest.\n");
         }
         else
         {
-            printf("Error: Unknown option: '%s'.", argv[i]);
-            return args_error(" Unknown option specified.");
+            printf("Error: Unknown option: '%s'.\n", argv[i]);
+            return args_error("Unknown option specified.");
         }
     }
 
-    if (memf_cnt == 0 || pgf_cnt == 0 || gstf_cnt == 0)
+    if (memf_cnt == 0 || pgf_cnt == 0 || gstf_cnt == 0 || *guest_count == 0)
         return args_error("Error: Not all options specified.\n");
 
     return 0;
 }
 
-int main(int argc, char *argv[])
+// For passing arguments to possix threads
+struct vm_args {
+	int vm_id;
+	const char *guest_img;
+	uint32_t mem_size;
+	uint32_t page_size;
+	//pthread_mutex_t io_lock;
+};
+
+void *vm_run(void *arg)
 {
+	struct vm_args *v_args = (struct vm_args *)arg;
 	struct vm v;
 	struct kvm_sregs sregs;
 	struct kvm_regs regs;
@@ -340,40 +361,31 @@ int main(int argc, char *argv[])
 	FILE* img;
 	int data;
 
-    uint32_t memsz_arg;
-    uint32_t pgsz_arg;
-    char* imgname_arg;
+	printf("[VM %d] Starting with guest: %s\n", v_args->vm_id, v_args->guest_img);
 
-	if (check_args(argc, argv, &memsz_arg, &pgsz_arg, &imgname_arg))
-        return 1;
-
-    MEM_SIZE = memsz_arg * 1024u * 1024u;
-    PAGE_SIZE = pgsz_arg * 1024u;
-    if (pgsz_arg == 2) PAGE_SIZE *= 1024u;
-
-	if (vm_init(&v, MEM_SIZE)) {
-		printf("Failed to init the VM\n");
-		return 1;
+	if (vm_init(&v, v_args->mem_size)) {
+		printf("[VM %d] Failed to init the VM\n", v_args->vm_id);
+		return NULL;
 	}
 
 	if (ioctl(v.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
 		perror("KVM_GET_SREGS");
 		vm_destroy(&v);
-		return 1;
+		return NULL;
 	}
 
-	setup_long_mode(&v, &sregs, PAGE_SIZE);
+	setup_long_mode(&v, &sregs, v_args->page_size);
 
-    if (ioctl(v.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
+	if (ioctl(v.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
 		perror("KVM_SET_SREGS");
 		vm_destroy(&v);
-		return 1;
+		return NULL;
 	}
 
-	if (load_guest_image(&v, imgname_arg, GUEST_START_ADDR) < 0) {
-		printf("Failed to load guest image\n");
+	if (load_guest_image(&v, v_args->guest_img, GUEST_START_ADDR) < 0) {
+		printf("[VM %d] Failed to load guest image\n", v_args->vm_id);
 		vm_destroy(&v);
-		return 1;
+		return NULL;
 	}
 
 	memset(&regs, 0, sizeof(regs));
@@ -386,49 +398,128 @@ int main(int argc, char *argv[])
 
 	if (ioctl(v.vcpu_fd, KVM_SET_REGS, &regs) < 0) {
 		perror("KVM_SET_REGS");
-		return 1;
+		vm_destroy(&v);
+		return NULL;
 	}
 
-	while(stop == 0) {
+	while (stop == 0) {
 		ret = ioctl(v.vcpu_fd, KVM_RUN, 0);
 		if (ret == -1) {
-			printf("KVM_RUN failed\n");
+			printf("[VM %d] KVM_RUN failed\n", v_args->vm_id);
 			vm_destroy(&v);
-			return 1;
+			return NULL;
 		}
 
 		switch (v.run->exit_reason) {
 			case KVM_EXIT_IO:
-				if (v.run->io.direction == KVM_EXIT_IO_OUT && v.run->io.port == 0xE9)
+				if (v.run->io.direction == KVM_EXIT_IO_OUT)
 				{
-					char *p = (char *)v.run;
-					printf("%c", *(p + v.run->io.data_offset));
+					switch (v.run->io.port)
+					{
+					case 0xE9: { // Print port
+						char *p = (char *)v.run;
+						printf("%c", *(p + v.run->io.data_offset));
+						break;
+					}
+					case 0xEE: // Custom instruction for mutex release
+						pthread_mutex_unlock(&output_mutex);
+						break;
+					
+					default:
+						break;
+					}
+					////pthread_mutex_lock(&io_lock);
+					//char *p = (char *)v.run;
+					//printf("%c", *(p + v.run->io.data_offset));
+					////pthread_mutex_unlock(&io_lock);
 				}
-				else if (v.run->io.direction == KVM_EXIT_IO_IN && v.run->io.port == 0xE9)
-                {
-					char *p = (char *)v.run;
-                    printf("Enter a number:\n");
-                    scanf("%c", (char *)(&data));
-					//char *data_in = ( p + v.run->io.data_offset );
-                    //(*data_in) = data;
-					//*(p + v.run->io.data_offset) = data;
-					char *data_in = ( ((char *)v.run) + v.run->io.data_offset );
-					(*data_in) = data;
+				else if (v.run->io.direction == KVM_EXIT_IO_IN)
+				{
+					switch (v.run->io.port)
+					{
+					case 0xE9:
+						pthread_mutex_lock(&io_lock);
+						//printf("[VM %d] Enter a number:\n", v_args->vm_id);
+						//scanf("%s", &data);
+						char buf[16];
+						scanf("%s", buf);
+						//scanf("%c", (char *)(&data));
+						char *data_in = ((char *)v.run) + v.run->io.data_offset;
+						//(*data_in) = data;
+						strcpy(data_in, buf);
+						pthread_mutex_unlock(&io_lock);
+						break;
+					
+					case 0xEE: // Custom instruction for mutex acquire
+						pthread_mutex_lock(&output_mutex);
+						break;
+
+					default:
+						break;
+					}
 				}
 				continue;
 			case KVM_EXIT_HLT:
-				printf("KVM_EXIT_HLT\n");
+				printf("[VM %d] KVM_EXIT_HLT\n", v_args->vm_id);
 				stop = 1;
 				break;
 			case KVM_EXIT_SHUTDOWN:
-				printf("Shutdown\n");
+				printf("[VM %d] Shutdown\n", v_args->vm_id);
 				stop = 1;
 				break;
 			default:
-				printf("Default - exit reason: %d\n", v.run->exit_reason);
+				printf("[VM %d] Default - exit reason: %d\n", v_args->vm_id, v.run->exit_reason);
+				stop = 1;
 				break;
     	}
   	}
 
 	vm_destroy(&v);
+	return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+	uint32_t memsz_arg;
+	uint32_t pgsz_arg;
+	char* guest_imgs[MAX_GUESTS];
+	int guest_count = 0;
+	//pthread_mutex_t shared_io_lock;
+
+	if (check_args(argc, argv, &memsz_arg, &pgsz_arg, guest_imgs, &guest_count))
+		return 1;
+
+	MEM_SIZE = memsz_arg * 1024u * 1024u;
+	PAGE_SIZE = pgsz_arg * 1024u;
+	if (pgsz_arg == 2) PAGE_SIZE *= 1024u;
+
+	//pthread_mutex_init(&shared_io_lock, NULL);
+	pthread_mutex_init(&io_lock, NULL);
+	pthread_mutex_init(&output_mutex, NULL);
+	pthread_t threads[MAX_GUESTS];
+	struct vm_args thread_args[MAX_GUESTS];
+
+	for (int i = 0; i < guest_count; i++)
+	{
+		thread_args[i].vm_id = i;
+		thread_args[i].guest_img = guest_imgs[i];
+		thread_args[i].mem_size = MEM_SIZE;
+		thread_args[i].page_size = PAGE_SIZE;
+		//thread_args[i].io_lock = shared_io_lock;
+		if (pthread_create(&threads[i], NULL, vm_run, &thread_args[i]) != 0) {
+			// pthread_mutex_destroy(&shared_io_lock);
+			pthread_mutex_destroy(&io_lock);
+			pthread_mutex_destroy(&output_mutex);
+			perror("pthread_create");
+			return 1;
+		}
+	}
+
+	for (int i = 0; i < guest_count; i++) pthread_join(threads[i], NULL);
+
+	printf("All guests finished.\n");
+	//pthread_mutex_destroy(&shared_io_lock);
+	pthread_mutex_destroy(&io_lock);
+	pthread_mutex_destroy(&output_mutex);
+	return 0;
 }
